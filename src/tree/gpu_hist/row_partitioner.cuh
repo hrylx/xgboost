@@ -197,36 +197,65 @@ struct LeafInfo {
   NodePositionInfo node;
 };
 
-XGBOOST_DEV_INLINE int GetPositionFromSegments(std::size_t idx,
-                                               const NodePositionInfo* d_node_info) {
-  int position = 0;
-  NodePositionInfo node = d_node_info[position];
-  while (!node.IsLeaf()) {
-    NodePositionInfo left = d_node_info[node.left_child];
-    NodePositionInfo right = d_node_info[node.right_child];
-    if (idx >= left.segment.begin && idx < left.segment.end) {
-      position = node.left_child;
-      node = left;
-    } else if (idx >= right.segment.begin && idx < right.segment.end) {
-      position = node.right_child;
-      node = right;
+// Flat (segment_begin, leaf_nidx) entry built once per FinalisePosition call.
+// Leaf segments tile [0, n_samples) disjointly so a sort by `seg_begin` is unique.
+struct LeafBoundary {
+  cuda_impl::RowIndexT seg_begin;
+  bst_node_t nidx;
+};
+
+// Locate the leaf whose segment contains position `idx` via upper_bound − 1 over
+// `d_leaves[*].seg_begin`. ceil(log2(n_leaves)) iterations vs the previous tree
+// walk's `depth` iterations — same count for a perfectly balanced tree, fewer for
+// unbalanced — and one read per iteration instead of two.
+XGBOOST_DEV_INLINE bst_node_t FindLeafForPosition(std::size_t idx,
+                                                  LeafBoundary const* d_leaves,
+                                                  std::int32_t n_leaves) {
+  std::int32_t lo = 0;
+  std::int32_t hi = n_leaves - 1;
+  while (lo < hi) {
+    std::int32_t mid = lo + ((hi - lo + 1) >> 1);
+    if (static_cast<std::size_t>(d_leaves[mid].seg_begin) <= idx) {
+      lo = mid;
     } else {
-      KERNEL_CHECK(false);
+      hi = mid - 1;
     }
   }
-  return position;
+  return d_leaves[lo].nidx;
 }
 
+// Build an inverse-permutation table inv_ridx so that inv_ridx[d_ridx[i]-base_ridx] == i.
+// Used by the reverse-iteration FinalisePosition kernel below to turn a scattered read
+// of d_gpair into a sequential one.
+template <int kBlockSize>
+__global__ __launch_bounds__(kBlockSize) void BuildInverseRidxKernel(
+    common::Span<const cuda_impl::RowIndexT> d_ridx, bst_idx_t base_ridx,
+    common::Span<cuda_impl::RowIndexT> d_inv_ridx) {
+  for (auto idx : dh::GridStrideRange<std::size_t>(0, d_ridx.size())) {
+    cuda_impl::RowIndexT ridx_offset = d_ridx[idx] - static_cast<cuda_impl::RowIndexT>(base_ridx);
+    d_inv_ridx[ridx_offset] = static_cast<cuda_impl::RowIndexT>(idx);
+  }
+}
+
+// Reverse-iteration variant: iterate by `ridx` (the row index) instead of by `idx`
+// (the position in d_ridx). The previous version had `for idx in [0,N): op(d_ridx[idx])`,
+// which made every read of d_gpair (80 MB, ridx-indexed) and write to d_out_position
+// (20 MB, ridx-indexed) a scattered access. With inv_ridx pre-built, we can iterate ridx
+// linearly: the d_gpair lookup inside `op` becomes a sequential 80 MB stream, and the
+// d_out_position write a sequential 20 MB stream. The cost is one extra
+// BuildInverseRidxKernel pass with a 20 MB scattered write — much cheaper than the 80
+// MB scattered read it eliminates.
 template <int kBlockSize, typename OpT>
 __global__ __launch_bounds__(kBlockSize) void FinalisePositionKernel(
-    common::Span<const NodePositionInfo> d_node_info, bst_idx_t base_ridx,
-    common::Span<const cuda_impl::RowIndexT> d_ridx, common::Span<bst_node_t> d_out_position,
-    OpT op) {
-  for (auto idx : dh::GridStrideRange<std::size_t>(0, d_ridx.size())) {
-    auto position = GetPositionFromSegments(idx, d_node_info.data());
-    cuda_impl::RowIndexT ridx = d_ridx[idx] - base_ridx;
-    bst_node_t new_position = op(ridx, position);
-    d_out_position[ridx] = new_position;
+    common::Span<const LeafBoundary> d_leaves,
+    common::Span<const cuda_impl::RowIndexT> d_inv_ridx,
+    common::Span<bst_node_t> d_out_position, OpT op) {
+  auto const n_leaves = static_cast<std::int32_t>(d_leaves.size());
+  for (auto ridx : dh::GridStrideRange<std::size_t>(0, d_inv_ridx.size())) {
+    cuda_impl::RowIndexT idx = d_inv_ridx[ridx];
+    bst_node_t leaf_nidx = FindLeafForPosition(idx, d_leaves.data(), n_leaves);
+    bst_node_t encoded = op(static_cast<cuda_impl::RowIndexT>(ridx), leaf_nidx);
+    d_out_position[ridx] = encoded;
   }
 }
 
@@ -263,6 +292,10 @@ class RowPartitioner {
    */
   dh::DeviceUVector<RowIndexT> ridx_;
   dh::DeviceUVector<RowIndexT> ridx_swap_;
+  // Scratch inverse-permutation buffer used by FinalisePosition. Mutable so that
+  // the const FinalisePosition member can resize it lazily; the contents are
+  // recomputed every call from `ridx_`.
+  mutable dh::DeviceUVector<RowIndexT> inv_ridx_;
   dh::DeviceUVector<int8_t> tmp_;
   dh::PinnedMemory pinned_;
   dh::PinnedMemory pinned2_;
@@ -436,10 +469,32 @@ class RowPartitioner {
   template <typename FinalisePositionOpT>
   void FinalisePosition(Context const* ctx, common::Span<bst_node_t> d_out_position,
                         bst_idx_t base_ridx, FinalisePositionOpT op) const {
-    dh::TemporaryArray<NodePositionInfo> d_node_info_storage(ridx_segments_.size());
-    dh::safe_cuda(cudaMemcpyAsync(d_node_info_storage.data().get(), ridx_segments_.data(),
-                                  sizeof(NodePositionInfo) * ridx_segments_.size(),
-                                  cudaMemcpyDefault, ctx->CUDACtx()->Stream()));
+    // 1) Build a flat sorted (segment.begin, leaf_nidx) array on the host. Leaf
+    //    segments tile [0, ridx_.size()) disjointly so a sort by `seg_begin` is
+    //    unique. The kernel uses binary search on this array to find each row's
+    //    leaf, replacing the previous root-to-leaf tree walk.
+    std::vector<LeafBoundary> h_leaves;
+    h_leaves.reserve(ridx_segments_.size());
+    for (bst_node_t i = 0; i < static_cast<bst_node_t>(ridx_segments_.size()); ++i) {
+      auto const& info = ridx_segments_[i];
+      if (info.IsLeaf()) {
+        h_leaves.push_back(LeafBoundary{info.segment.begin, i});
+      }
+    }
+    std::sort(h_leaves.begin(), h_leaves.end(),
+              [](LeafBoundary const& a, LeafBoundary const& b) {
+                return a.seg_begin < b.seg_begin;
+              });
+
+    dh::TemporaryArray<LeafBoundary> d_leaves(h_leaves.size());
+    dh::safe_cuda(cudaMemcpyAsync(d_leaves.data().get(), h_leaves.data(),
+                                  sizeof(LeafBoundary) * h_leaves.size(), cudaMemcpyDefault,
+                                  ctx->CUDACtx()->Stream()));
+
+    // 2) Build inv_ridx so that inv_ridx[ridx] == idx (where d_ridx[idx] == ridx + base_ridx).
+    //    The build pass has one scattered write of 20 MB (5M × 4 B) — much cheaper than
+    //    the 80 MB scattered read of d_gpair the main kernel saves below.
+    inv_ridx_.resize(ridx_.size());
 
     constexpr std::uint32_t kBlockSize = 512;
     const int kItemsThread = 8;
@@ -447,8 +502,15 @@ class RowPartitioner {
         xgboost::common::DivRoundUp(ridx_.size(), kBlockSize * kItemsThread);
     common::Span<RowIndexT const> d_ridx{ridx_.data(), ridx_.size()};
     dh::LaunchKernel{grid_size, kBlockSize, 0, ctx->CUDACtx()->Stream()}(
-        FinalisePositionKernel<kBlockSize, FinalisePositionOpT>, dh::ToSpan(d_node_info_storage),
-        base_ridx, d_ridx, d_out_position, op);
+        BuildInverseRidxKernel<kBlockSize>, d_ridx, base_ridx, dh::ToSpan(inv_ridx_));
+
+    // 3) Reverse-iteration finalise pass: iterate by ridx (sequential reads of d_gpair
+    //    inside `op` and sequential writes to d_out_position). The single random read is
+    //    inv_ridx[ridx], which is itself a sequential stream now.
+    common::Span<RowIndexT const> d_inv_ridx{inv_ridx_.data(), inv_ridx_.size()};
+    dh::LaunchKernel{grid_size, kBlockSize, 0, ctx->CUDACtx()->Stream()}(
+        FinalisePositionKernel<kBlockSize, FinalisePositionOpT>, dh::ToSpan(d_leaves), d_inv_ridx,
+        d_out_position, op);
   }
 };
 
