@@ -32,11 +32,10 @@ void TestUpdatePositionBatch() {
     EXPECT_EQ(rows[i], i);
   }
   std::vector<int> extra_data = {0};
-  dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(kNumRows);
   // Send the first five training instances to the right node
   // and the second 5 to the left node
   rp.UpdatePositionBatch(
-      &ctx, {0}, {1}, {2}, extra_data, dh::ToSpan(ridx_tmp),
+      &ctx, {0}, {1}, {2}, extra_data,
       [=] __device__(RowPartitioner::RowIndexT ridx, int, int) { return ridx > 4; });
   rows = rp.GetRowsHost(1);
   for (auto r : rows) {
@@ -49,7 +48,7 @@ void TestUpdatePositionBatch() {
 
   // Split the left node again
   rp.UpdatePositionBatch(
-      &ctx, {1}, {3}, {4}, extra_data, dh::ToSpan(ridx_tmp),
+      &ctx, {1}, {3}, {4}, extra_data,
       [=] __device__(RowPartitioner::RowIndexT ridx, int, int) { return ridx < 7; });
   EXPECT_EQ(rp.GetRows(3).size(), 2);
   EXPECT_EQ(rp.GetRows(4).size(), 3);
@@ -60,7 +59,10 @@ TEST(RowPartitioner, Batch) { TestUpdatePositionBatch(); }
 void TestSortPositionBatch(const std::vector<int>& ridx_in, const std::vector<Segment>& segments) {
   auto ctx = MakeCUDACtx(0);
   thrust::device_vector<cuda_impl::RowIndexT> ridx = ridx_in;
-  thrust::device_vector<cuda_impl::RowIndexT> ridx_tmp(ridx_in.size());
+  // SortPositionBatch scatters from `ridx` into `ridx_out`. Pre-seed the destination
+  // with the input so untouched rows match the source (the RowPartitioner does the
+  // same via a memcpy when not all rows are in the current call).
+  thrust::device_vector<cuda_impl::RowIndexT> ridx_out = ridx_in;
   thrust::device_vector<cuda_impl::RowIndexT> counts(segments.size());
 
   auto op = [=] __device__(auto ridx, int split_index, int data) {
@@ -79,16 +81,17 @@ void TestSortPositionBatch(const std::vector<int>& ridx_in, const std::vector<Se
                                 h_batch_info.size() * sizeof(PerNodeData<int>), cudaMemcpyDefault,
                                 nullptr));
   dh::DeviceUVector<std::int8_t> tmp;
-  SortPositionBatch<decltype(op), int>(&ctx, dh::ToSpan(d_batch_info), dh::ToSpan(ridx),
-                                       dh::ToSpan(ridx_tmp), dh::ToSpan(counts), total_rows, op,
-                                       &tmp);
+  SortPositionBatch<decltype(op), int>(
+      &ctx, dh::ToSpan(d_batch_info),
+      common::Span<cuda_impl::RowIndexT const>{thrust::raw_pointer_cast(ridx.data()), ridx.size()},
+      dh::ToSpan(ridx_out), dh::ToSpan(counts), total_rows, op, &tmp);
 
   auto op_without_data = [=] __device__(auto ridx) {
     return ridx % 2 == 0;
   };
   for (size_t i = 0; i < segments.size(); i++) {
-    auto begin = ridx.begin() + segments[i].begin;
-    auto end = ridx.begin() + segments[i].end;
+    auto begin = ridx_out.begin() + segments[i].begin;
+    auto end = ridx_out.begin() + segments[i].end;
     bst_uint count = counts[i];
     auto left_partition_count =
         thrust::count_if(thrust::device, begin, begin + count, op_without_data);
@@ -162,11 +165,9 @@ void TestExternalMemory() {
 
     partitioners.emplace_back(std::make_unique<RowPartitioner>());
     partitioners.back()->Reset(&ctx, page.Size(), page.BaseRowId());
-    dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(page.Size());
     std::vector<RegTree::Node> splits{tree[0]};
     page.Impl()->Visit(&ctx, {}, [&](auto&& acc) {
-      partitioners.back()->UpdatePositionBatch(&ctx, {0}, {1}, {2}, splits, dh::ToSpan(ridx_tmp),
-                                               LessThanOp{acc});
+      partitioners.back()->UpdatePositionBatch(&ctx, {0}, {1}, {2}, splits, LessThanOp{acc});
     });
     partitioners.back()->FinalisePosition(
         &ctx, dh::ToSpan(position).subspan(page.BaseRowId(), page.Size()), page.BaseRowId(),
@@ -205,9 +206,8 @@ void TestEmptyNode(std::int32_t n_workers) {
     bst_idx_t base_rowid = 0;
     partitioner.Reset(&ctx, n_samples, base_rowid);
     std::vector<RegTree::Node> splits(1);
-    dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(n_samples);
     partitioner.UpdatePositionBatch(
-        &ctx, {0}, {1}, {2}, splits, dh::ToSpan(ridx_tmp),
+        &ctx, {0}, {1}, {2}, splits,
         [] XGBOOST_DEVICE(bst_idx_t ridx, std::int32_t /*nidx_in_batch*/, RegTree::Node) {
           return ridx < 3;
         });

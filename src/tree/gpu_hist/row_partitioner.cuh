@@ -8,6 +8,7 @@
 #include <algorithm>        // for max
 #include <cstddef>          // for size_t
 #include <cstdint>          // for int32_t, uint32_t
+#include <utility>          // for swap
 #include <cuda/functional>  // for proclaim_return_type
 #include <vector>           // for vector
 
@@ -70,22 +71,6 @@ XGBOOST_DEV_INLINE void AssignBatch(dh::LDGIterator<T> const& batch_info_iter,
   }
 }
 
-/**
- * @param total_rows The total number of rows for this batch of nodes.
- */
-template <int kBlockSize, typename OpDataT>
-__global__ __launch_bounds__(kBlockSize) void SortPositionCopyKernel(
-    dh::LDGIterator<PerNodeData<OpDataT>> batch_info_iter,
-    common::Span<cuda_impl::RowIndexT> d_ridx,
-    common::Span<cuda_impl::RowIndexT const> const ridx_tmp, bst_idx_t total_rows) {
-  for (auto idx : dh::GridStrideRange<std::size_t>(0, total_rows)) {
-    std::int32_t batch_idx;  // unused
-    std::size_t item_idx = std::numeric_limits<std::size_t>::max();
-    AssignBatch(batch_info_iter, idx, &batch_idx, &item_idx);
-    d_ridx[item_idx] = ridx_tmp[item_idx];
-  }
-}
-
 // We can scan over this tuple, where the scan gives us information on how to partition inputs
 // according to the flag
 struct IndexFlagTuple {
@@ -141,15 +126,20 @@ struct WriteResultsFunctor {
 
 /**
  * @param d_batch_info Node data, with the size of the input number of nodes.
+ *
+ * Reads from `ridx_in` and scatters the sorted indices into `ridx_out`.
+ * The caller is responsible for ensuring that rows outside any segment in
+ * `d_batch_info` already hold the correct values in `ridx_out` before the call
+ * (typically via the ping-pong buffers in RowPartitioner).
  */
 template <typename OpT, typename OpDataT>
 void SortPositionBatch(Context const* ctx, common::Span<const PerNodeData<OpDataT>> d_batch_info,
-                       common::Span<cuda_impl::RowIndexT> ridx,
-                       common::Span<cuda_impl::RowIndexT> ridx_tmp,
+                       common::Span<cuda_impl::RowIndexT const> ridx_in,
+                       common::Span<cuda_impl::RowIndexT> ridx_out,
                        common::Span<cuda_impl::RowIndexT> d_counts, bst_idx_t total_rows, OpT op,
                        dh::DeviceUVector<int8_t>* tmp) {
   dh::LDGIterator<PerNodeData<OpDataT>> batch_info_itr(d_batch_info.data());
-  WriteResultsFunctor<OpDataT> write_results{batch_info_itr, ridx.data(), ridx_tmp.data(),
+  WriteResultsFunctor<OpDataT> write_results{batch_info_itr, ridx_in.data(), ridx_out.data(),
                                              d_counts.data()};
 
   auto discard_write_iterator =
@@ -160,7 +150,7 @@ void SortPositionBatch(Context const* ctx, common::Span<const PerNodeData<OpData
         std::int32_t nidx_in_batch;
         std::size_t item_idx;
         AssignBatch(batch_info_itr, idx, &nidx_in_batch, &item_idx);
-        auto go_left = op(ridx[item_idx], nidx_in_batch, batch_info_itr[nidx_in_batch].data);
+        auto go_left = op(ridx_in[item_idx], nidx_in_batch, batch_info_itr[nidx_in_batch].data);
         return IndexFlagTuple{static_cast<cuda_impl::RowIndexT>(item_idx), go_left, nidx_in_batch,
                               go_left};
       }));
@@ -193,15 +183,6 @@ void SortPositionBatch(Context const* ctx, common::Span<const PerNodeData<OpData
                                                                     total_rows),
                                                                 ctx->CUDACtx()->Stream());
   dh::safe_cuda(ret);
-
-  constexpr int kBlockSize = 256;
-
-  // Value found by experimentation
-  const int kItemsThread = 12;
-  std::uint32_t const kGridSize =
-      xgboost::common::DivRoundUp(total_rows, kBlockSize * kItemsThread);
-  dh::LaunchKernel{kGridSize, kBlockSize, 0, ctx->CUDACtx()->Stream()}(
-      SortPositionCopyKernel<kBlockSize, OpDataT>, batch_info_itr, ridx, ridx_tmp, total_rows);
 }
 
 struct NodePositionInfo {
@@ -273,8 +254,15 @@ class RowPartitioner {
    * This looks like:
    * node id  |    1    |    2   |
    * rows idx | 3, 5, 1 | 13, 31 |
+   *
+   * `ridx_` is the active buffer, `ridx_swap_` is the scratch destination for the
+   * next partitioning pass. After each `UpdatePositionBatch` we swap them — the
+   * scratch becomes active and the old active becomes the next scratch. This
+   * eliminates a per-call copy kernel that previously copied the scattered
+   * results back into `ridx_`.
    */
   dh::DeviceUVector<RowIndexT> ridx_;
+  dh::DeviceUVector<RowIndexT> ridx_swap_;
   dh::DeviceUVector<int8_t> tmp_;
   dh::PinnedMemory pinned_;
   dh::PinnedMemory pinned2_;
@@ -344,7 +332,7 @@ class RowPartitioner {
   void UpdatePositionBatch(Context const* ctx, std::vector<bst_node_t> const& nidx,
                            std::vector<bst_node_t> const& left_nidx,
                            std::vector<bst_node_t> const& right_nidx,
-                           std::vector<OpDataT> const& op_data, common::Span<RowIndexT> ridx_tmp,
+                           std::vector<OpDataT> const& op_data,
                            UpdatePositionOpT op) {
     if (nidx.empty()) {
       return;
@@ -358,8 +346,11 @@ class RowPartitioner {
         pinned2_.GetSpan<PerNodeData<OpDataT>>(nidx.size());
     dh::TemporaryArray<PerNodeData<OpDataT>> d_batch_info(nidx.size());
 
+    bst_idx_t total_touched = 0;
     for (std::size_t i = 0; i < nidx.size(); i++) {
-      h_batch_info[i] = {ridx_segments_.at(nidx[i]).segment, op_data[i]};
+      auto seg = ridx_segments_.at(nidx[i]).segment;
+      h_batch_info[i] = {seg, op_data[i]};
+      total_touched += seg.Size();
     }
     dh::safe_cuda(cudaMemcpyAsync(d_batch_info.data().get(), h_batch_info.data(),
                                   h_batch_info.size_bytes(), cudaMemcpyDefault,
@@ -368,7 +359,17 @@ class RowPartitioner {
     auto h_counts = pinned_.GetSpan<RowIndexT>(nidx.size());
     // Must initialize with 0 as 0 count is not written in the kernel.
     dh::TemporaryArray<RowIndexT> d_counts(nidx.size(), 0);
-    CHECK_EQ(ridx_tmp.size(), this->Size());
+    CHECK_EQ(ridx_swap_.size(), this->ridx_.size());
+
+    // If this call does not touch every row, the untouched rows in the swap buffer
+    // would otherwise hold stale values from a previous pass. Seed the swap buffer
+    // with the current ridx so that after the scatter+swap the inactive rows still
+    // hold the correct row indices.
+    if (total_touched != this->ridx_.size()) {
+      dh::safe_cuda(cudaMemcpyAsync(this->ridx_swap_.data(), this->ridx_.data(),
+                                    sizeof(RowIndexT) * this->ridx_.size(), cudaMemcpyDefault,
+                                    ctx->CUDACtx()->Stream()));
+    }
 
     // Process a sub-batch
     auto sub_batch_impl = [&](common::Span<bst_node_t const> nidx,
@@ -379,10 +380,11 @@ class RowPartitioner {
         total_rows += this->ridx_segments_[i].segment.Size();
       }
 
-      // Partition the rows according to the operator
-      SortPositionBatch<UpdatePositionOpT, OpDataT>(ctx, d_batch_info, dh::ToSpan(this->ridx_),
-                                                    ridx_tmp, d_counts, total_rows, op,
-                                                    &this->tmp_);
+      // Partition the rows according to the operator: read from ridx_, scatter into ridx_swap_.
+      SortPositionBatch<UpdatePositionOpT, OpDataT>(
+          ctx, d_batch_info,
+          common::Span<RowIndexT const>{this->ridx_.data(), this->ridx_.size()},
+          dh::ToSpan(this->ridx_swap_), d_counts, total_rows, op, &this->tmp_);
     };
 
     // Divide inputs into sub-batches.
@@ -395,6 +397,11 @@ class RowPartitioner {
       auto d_counts_batch = dh::ToSpan(d_counts).subspan(batch_begin, batch_size);
       sub_batch_impl(nidx_batch, d_info_batch, d_counts_batch);
     }
+
+    // Ping-pong: the freshly scattered swap buffer becomes the active one. The old
+    // active buffer is now scratch for the next call. No copy kernel needed.
+    using std::swap;
+    swap(this->ridx_, this->ridx_swap_);
 
     dh::safe_cuda(cudaMemcpyAsync(h_counts.data(), d_counts.data().get(), h_counts.size_bytes(),
                                   cudaMemcpyDefault, ctx->CUDACtx()->Stream()));
@@ -448,9 +455,8 @@ class RowPartitioner {
 // Partitioner for all batches, used for external memory training.
 class RowPartitionerBatches {
  private:
-  // Temporary buffer for sorting the samples.
-  dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp_;
-  // Partitioners for each batch.
+  // Partitioners for each batch. Each partitioner owns its own ping-pong scratch
+  // buffer; no shared scratch is needed at this level.
   std::vector<std::unique_ptr<RowPartitioner>> partitioners_;
 
  public:
@@ -461,7 +467,6 @@ class RowPartitionerBatches {
       partitioners_.clear();
     }
 
-    bst_idx_t n_max_samples = 0;
     for (std::size_t k = 0; k < n_batches; ++k) {
       if (partitioners_.size() != n_batches) {
         // First run.
@@ -471,9 +476,7 @@ class RowPartitionerBatches {
       auto n_samples = batch_ptr.at(k + 1) - base_ridx;
       partitioners_[k]->Reset(ctx, n_samples, base_ridx);
       CHECK_LE(n_samples, std::numeric_limits<cuda_impl::RowIndexT>::max());
-      n_max_samples = std::max(n_samples, n_max_samples);
     }
-    this->ridx_tmp_.resize(n_max_samples);
   }
 
   // Accessors
@@ -495,8 +498,7 @@ class RowPartitionerBatches {
                            std::vector<bst_node_t> const& right_nidx,
                            std::vector<OpDataT> const& op_data, UpdatePositionOpT op) {
     auto& part = this->At(batch_idx);
-    auto ridx_tmp = dh::ToSpan(this->ridx_tmp_).subspan(0, part->Size());
-    part->UpdatePositionBatch(ctx, nidx, left_nidx, right_nidx, op_data, ridx_tmp, op);
+    part->UpdatePositionBatch(ctx, nidx, left_nidx, right_nidx, op_data, op);
   }
 };
 };  // namespace xgboost::tree
