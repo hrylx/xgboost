@@ -36,7 +36,9 @@ jobs:
         with:
           cuda: '13.1.1'
           method: 'network'
-          sub-packages: '["nvcc","cudart","cublas","cublas_dev","curand","curand_dev","thrust","visual_studio_integration"]'
+          # No sub-packages filter — install full toolkit. Selective installs are
+          # fragile across CUDA major versions because dev-headers (crt/host_config.h
+          # etc.) move between packages. Build time difference is small (~3-5 min).
 
       - name: Install Python build deps
         run: |
